@@ -80,15 +80,20 @@ if os.name != "nt":
             rfd, wfd = address.split(",", maxsplit=1)
             self.rf = open(int(rfd), "rb", 0)
             self.wf = open(int(wfd), "wb", 0)
+            self.read_lock = threading.Lock()
+            self.write_lock = threading.Lock()
 
         def read(self, n):
-            return self.rf.read(n)
+            with self.read_lock:
+                return self.rf.read(n)
 
         def readline(self):
-            return self.rf.readline()
+            with self.read_lock:
+                return self.rf.readline()
 
         def write(self, data):
-            return self.wf.write(data)
+            with self.write_lock:
+                return self.wf.write(data)
 
         def close(self):
             self.rf.close()

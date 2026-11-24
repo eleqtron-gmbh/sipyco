@@ -1,10 +1,10 @@
 import asyncio
-import signal
-import socket
-import ssl
 import atexit
 import collections
 import logging
+import signal
+import socket
+import ssl
 from copy import copy
 
 from sipyco import keepalive
@@ -15,13 +15,16 @@ logger = logging.getLogger(__name__)
 class TaskObject:
     def start(self, *, loop=None):
         """loop must be specified unless this is called from a running event loop."""
+
         async def log_exceptions(awaitable):
             try:
                 return await awaitable()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.error("Unhandled exception in TaskObject task body", exc_info=True)
+                logger.error(
+                    "Unhandled exception in TaskObject task body", exc_info=True
+                )
                 raise
 
         self.task = asyncio.ensure_future(log_exceptions(self._do), loop=loop)
@@ -57,6 +60,7 @@ class AsyncioServer:
     :meth:`~sipyco.asyncio_server.AsyncioServer._handle_connection_cr`
     method/coroutine.
     """
+
     def __init__(self):
         self._client_tasks = set()
 
@@ -78,10 +82,13 @@ class AsyncioServer:
         ssl_context = None
         if ssl_config is not None:
             ssl_context = ssl_config.create_server_context()
-        self.server = await asyncio.start_server(self._handle_connection,
-                                                 host, port,
-                                                 ssl=ssl_context,
-                                                 limit=4*1024*1024)
+        self.server = await asyncio.start_server(
+            self._handle_connection,
+            host,
+            port,
+            ssl=ssl_context,
+            limit=100 * 1024 * 1024,
+        )
 
     async def stop(self):
         """Stops the server."""
@@ -201,6 +208,7 @@ class SimpleSSLConfig:
     :param local_key: Local private key file path.
     :param peer_cert: Peer's certificate file path to trust.
     """
+
     def __init__(self, local_cert, local_key, peer_cert):
         self.local_cert = local_cert
         self.local_key = local_key

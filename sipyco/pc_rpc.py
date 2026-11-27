@@ -15,27 +15,31 @@ import asyncio
 import inspect
 import logging
 import socket
+import struct
 import threading
 import time
 from operator import itemgetter
 
-from sipyco import keepalive, pyon
-from sipyco.asyncio_tools import SignalHandler, AsyncioServer as _AsyncioServer
+import msgpack
+import msgpack_numpy
+
+from sipyco import keepalive
+from sipyco.asyncio_tools import AsyncioServer as _AsyncioServer
+from sipyco.asyncio_tools import SignalHandler
 from sipyco.packed_exceptions import *
 
+msgpack_numpy.patch()
 logger = logging.getLogger(__name__)
 
 
 class AutoTarget:
     """Use this as target value in clients for them to automatically connect
     to the target exposed by the server. Servers must have only one target."""
-    pass
 
 
 class IncompatibleServer(Exception):
     """Raised by the client when attempting to connect to a server that does
     not have the expected target."""
-    pass
 
 
 _init_string = b"ARTIQ pc_rpc\n"
@@ -44,27 +48,49 @@ _init_string = b"ARTIQ pc_rpc\n"
 def _validate_target_name(target_name, target_names):
     if target_name is AutoTarget:
         if len(target_names) > 1:
-            raise ValueError("Server has multiple targets: " +
-                             " ".join(sorted(target_names)))
+            raise ValueError(
+                "Server has multiple targets: " + " ".join(sorted(target_names))
+            )
         else:
             target_name = target_names[0]
     elif target_name not in target_names:
         raise IncompatibleServer(
-            "valid target name(s): " + " ".join(sorted(target_names)))
+            "valid target name(s): " + " ".join(sorted(target_names))
+        )
     return target_name
 
 
-def _socket_readline(socket, bufsize=4096):
-    buf = socket.recv(bufsize).decode()
-    offset = 0
-    while buf.find("\n", offset) == -1:
-        more = socket.recv(bufsize)
-        if not more:
-            break
-        buf += more.decode()
-        offset += len(more)
+def _socket_readmsg(socket: socket.SocketType) -> object:
+    """Reads a length-encoded msgpack message from a socket"""
+    length_bytes = socket.recv(4)
+    length = struct.unpack("I", length_bytes)[0]
+    buf = socket.recv(length)
+    return msgpack.unpackb(buf, strict_map_key=False)
 
-    return buf
+
+async def _reader_readmsg(reader: asyncio.StreamReader) -> object:
+    """Same as the above, but reads from a asyncio StreamReader"""
+    length_bytes = await reader.readexactly(4)
+    length = struct.unpack("I", length_bytes)[0]
+    buf = await reader.readexactly(length)
+    return msgpack.unpackb(buf, strict_map_key=False)
+
+
+def _socket_writemsg(socket: socket.SocketType, obj: object):
+    """Writes a length encoded message to a socket"""
+    msg = msgpack.packb(obj)
+    length_bytes = struct.pack("I", len(msg))
+    socket.send(length_bytes)
+    socket.sendall(msg)
+
+
+async def _writer_writemessage(writer: asyncio.StreamWriter, obj: object):
+    """Same as above, but using an asyncio.StreamWriter"""
+    msg = msgpack.packb(obj)
+    length_bytes = struct.pack("I", len(msg))
+    writer.write(length_bytes)
+    writer.write(msg)
+    await writer.drain()
 
 
 class Client:
@@ -111,9 +137,10 @@ class Client:
         self.__lock = threading.Lock()
 
         try:
-            self.__socket.sendall(_init_string)
+            _socket_writemsg(self.__socket, _init_string)
 
-            server_identification = self.__recv()
+            server_identification = _socket_readmsg(self.__socket)
+            assert isinstance(server_identification, dict)
             self.__target_names = server_identification["targets"]
             self.__description = server_identification["description"]
             self.__selected_target = None
@@ -128,9 +155,9 @@ class Client:
         """Selects a RPC target by name. This function should be called
         exactly once if the object was created with ``target_name=None``."""
         target_name = _validate_target_name(target_name, self.__target_names)
-        self.__socket.sendall((target_name + "\n").encode())
-        self.__selected_target = target_name
-        self.__valid_methods = self.__recv()
+
+        _socket_writemsg(self.__socket, target_name)
+        self.__valid_methods = _socket_readmsg(self.__socket)
 
     def get_selected_target(self):
         """Returns the selected target, or ``None`` if no target has been
@@ -153,18 +180,11 @@ class Client:
         """
         self.__socket.close()
 
-    def __send(self, obj):
-        line = pyon.encode(obj) + "\n"
-        self.__socket.sendall(line.encode())
-
-    def __recv(self):
-        line = _socket_readline(self.__socket)
-        return pyon.decode(line)
-
     def __do_action(self, action):
-        self.__send(action)
 
-        obj = self.__recv()
+        _socket_writemsg(self.__socket, action)
+        obj = _socket_readmsg(self.__socket)
+        assert isinstance(obj, dict)
         if obj["status"] == "ok":
             return obj["ret"]
         elif obj["status"] == "failed":
@@ -187,6 +207,7 @@ class Client:
         def proxy(*args, **kwargs):
             with self.__lock:
                 return self.__do_rpc(name, args, kwargs)
+
         return proxy
 
 
@@ -211,11 +232,14 @@ class AsyncioClient:
         """Connects to the server. This cannot be done in __init__ because
         this method is a coroutine. See :class:`sipyco.pc_rpc.Client` for a description of the
         parameters."""
-        self.__reader, self.__writer = \
-            await keepalive.async_open_connection(host, port, limit=100 * 1024 * 1024)
+        self.__reader, self.__writer = await keepalive.async_open_connection(
+            host, port, limit=100 * 1024 * 1024
+        )
         try:
-            self.__writer.write(_init_string)
-            server_identification = await self.__recv()
+            await _writer_writemessage(self.__writer, _init_string)
+
+            server_identification = await _reader_readmsg(self.__reader)
+            assert isinstance(server_identification, dict)
             self.__target_names = server_identification["targets"]
             self.__description = server_identification["description"]
             self.__selected_target = None
@@ -231,9 +255,11 @@ class AsyncioClient:
         exactly once if the connection was created with ``target_name=None``.
         """
         target_name = _validate_target_name(target_name, self.__target_names)
-        self.__writer.write((target_name + "\n").encode())
-        self.__selected_target = target_name
-        self.__valid_methods = await self.__recv()
+
+        assert isinstance(self.__writer, asyncio.StreamWriter)
+        assert isinstance(self.__reader, asyncio.StreamReader)
+        await _writer_writemessage(self.__writer, target_name)
+        self.__valid_methods = await _reader_readmsg(self.__reader)
 
     def get_selected_target(self):
         """Returns the selected target, or ``None`` if no target has been
@@ -261,22 +287,18 @@ class AsyncioClient:
         self.__target_names = None
         self.__description = None
 
-    def __send(self, obj):
-        line = pyon.encode(obj) + "\n"
-        self.__writer.write(line.encode())
-
-    async def __recv(self):
-        line = await self.__reader.readline()
-        return pyon.decode(line.decode())
-
     async def __do_rpc(self, name, args, kwargs):
+
+        assert isinstance(self.__reader, asyncio.StreamReader)
+        assert isinstance(self.__writer, asyncio.StreamWriter)
+
         await self.__lock.acquire()
         try:
-            obj = {"action": "call", "name": name,
-                   "args": args, "kwargs": kwargs}
-            self.__send(obj)
+            obj = {"action": "call", "name": name, "args": args, "kwargs": kwargs}
+            await _writer_writemessage(self.__writer, obj)
 
-            obj = await self.__recv()
+            obj = await _reader_readmsg(self.__reader)
+            assert isinstance(obj, dict)
             if obj["status"] == "ok":
                 return obj["ret"]
             elif obj["status"] == "failed":
@@ -293,6 +315,7 @@ class AsyncioClient:
         async def proxy(*args, **kwargs):
             res = await self.__do_rpc(name, args, kwargs)
             return res
+
         return proxy
 
 
@@ -310,8 +333,7 @@ class BestEffortClient:
         in the background.
     """
 
-    def __init__(self, host, port, target_name,
-                 firstcon_timeout=1.0, retry=5.0):
+    def __init__(self, host, port, target_name, firstcon_timeout=1.0, retry=5.0):
         self.__host = host
         self.__port = port
         self.__target_name = target_name
@@ -323,28 +345,35 @@ class BestEffortClient:
         try:
             self.__coninit(firstcon_timeout)
         except:
-            logger.warning("first connection attempt to %s:%d[%s] failed, "
-                           "retrying in the background",
-                           self.__host, self.__port, self.__target_name,
-                           exc_info=True)
+            logger.warning(
+                "first connection attempt to %s:%d[%s] failed, "
+                "retrying in the background",
+                self.__host,
+                self.__port,
+                self.__target_name,
+                exc_info=True,
+            )
             self.__start_conretry()
         else:
             self.__conretry_thread = None
 
     def __coninit(self, timeout):
         if timeout is None:
-            self.__socket = socket.create_connection(
-                (self.__host, self.__port))
+            self.__socket = socket.create_connection((self.__host, self.__port))
         else:
             self.__socket = socket.create_connection(
-                (self.__host, self.__port), timeout)
-        self.__socket.sendall(_init_string)
-        server_identification = self.__recv()
-        target_name = _validate_target_name(self.__target_name,
-                                            server_identification["targets"])
-        self.__socket.sendall((target_name + "\n").encode())
-        self.__valid_methods = self.__recv()
+                (self.__host, self.__port), timeout
+            )
 
+        _socket_writemsg(self.__socket, _init_string)
+
+        server_identification = _socket_readmsg(self.__socket)
+        assert isinstance(server_identification, dict)
+        target_name = _validate_target_name(
+            self.__target_name, server_identification["targets"]
+        )
+
+        _socket_writemsg(self.__socket, target_name)
         # Only after the initial handshake is complete, disable the socket
         # timeout (if any). Otherwise, the constructor can block forever if a
         # server accepts the connection but does not respond.
@@ -365,9 +394,12 @@ class BestEffortClient:
             else:
                 break
         if not self.__conretry_terminate:
-            logger.warning("connection to %s:%d[%s] established in "
-                           "the background",
-                           self.__host, self.__port, self.__target_name)
+            logger.warning(
+                "connection to %s:%d[%s] established in the background",
+                self.__host,
+                self.__port,
+                self.__target_name,
+            )
         if self.__conretry_terminate and self.__socket is not None:
             self.__socket.close()
         # must be after __socket.close() to avoid race condition
@@ -386,30 +418,29 @@ class BestEffortClient:
             # Python fails to provide a way to cancel threads...
             self.__conretry_terminate = True
 
-    def __send(self, obj):
-        line = pyon.encode(obj) + "\n"
-        self.__socket.sendall(line.encode())
-
-    def __recv(self):
-        line = _socket_readline(self.__socket)
-        return pyon.decode(line)
-
     def __do_rpc(self, name, args, kwargs):
+        assert isinstance(self.__socket, socket.SocketType)
+
         if self.__conretry_thread is not None:
             return None
 
         obj = {"action": "call", "name": name, "args": args, "kwargs": kwargs}
         try:
-            self.__send(obj)
-            obj = self.__recv()
+            _socket_writemsg(self.__socket, obj)
+            obj = _socket_readmsg(self.__socket)
         except:
-            logger.warning("connection failed while attempting "
-                           "RPC to %s:%d[%s], re-establishing connection "
-                           "in the background",
-                           self.__host, self.__port, self.__target_name)
+            logger.warning(
+                "connection failed while attempting "
+                "RPC to %s:%d[%s], re-establishing connection "
+                "in the background",
+                self.__host,
+                self.__port,
+                self.__target_name,
+            )
             self.__start_conretry()
             return None
         else:
+            assert isinstance(obj, dict)
             if obj["status"] == "ok":
                 return obj["ret"]
             elif obj["status"] == "failed":
@@ -423,6 +454,7 @@ class BestEffortClient:
 
         def proxy(*args, **kwargs):
             return self.__do_rpc(name, args, kwargs)
+
         return proxy
 
     def get_selected_target(self):
@@ -488,8 +520,9 @@ class Server(_AsyncioServer):
         methods.
     """
 
-    def __init__(self, targets, description=None, builtin_terminate=False,
-                 allow_parallel=False):
+    def __init__(
+        self, targets, description=None, builtin_terminate=False, allow_parallel=False
+    ):
         _AsyncioServer.__init__(self)
         self.targets = targets
         self.description = description
@@ -528,10 +561,7 @@ class Server(_AsyncioServer):
         try:
             if obj["action"] == "get_rpc_method_list":
                 members = inspect.getmembers(target, callable)
-                doc = {
-                    "docstring": inspect.getdoc(target),
-                    "methods": {}
-                }
+                doc = {"docstring": inspect.getdoc(target), "methods": {}}
                 for name, method in members:
                     if name.startswith("_"):
                         continue
@@ -547,13 +577,13 @@ class Server(_AsyncioServer):
                             "kwonlyargs": [],
                             "kwonlydefaults": [],
                         },
-                        "Terminate the server.")
+                        "Terminate the server.",
+                    )
                 logger.debug("RPC docs for %s: %s", target, doc)
                 return doc
             elif obj["action"] == "call":
                 logger.debug("calling %s", _PrettyPrintCall(obj))
-                if (self.builtin_terminate and obj["name"] ==
-                        "terminate"):
+                if self.builtin_terminate and obj["name"] == "terminate":
                     self._terminate_request.set()
                     return None
                 else:
@@ -563,18 +593,14 @@ class Server(_AsyncioServer):
                         ret = await ret
                     return ret
             else:
-                raise ValueError("Unknown action: {}"
-                                 .format(obj["action"]))
+                raise ValueError("Unknown action: {}".format(obj["action"]))
         finally:
             if self._noparallel is not None:
                 self._noparallel.release()
 
-    async def _process_and_pyonize(self, target, obj):
+    async def _process(self, target, obj):
         try:
-            return pyon.encode({
-                "status": "ok",
-                "ret": await self._process_action(target, obj)
-            })
+            return {"status": "ok", "ret": await self._process_action(target, obj)}
         except asyncio.CancelledError:
             raise
         except SystemExit:
@@ -583,27 +609,27 @@ class Server(_AsyncioServer):
             else:
                 raise
         except:
-            return pyon.encode({
-                "status": "failed",
-                "exception": current_exc_packed()
-            })
+            return {"status": "failed", "exception": current_exc_packed()}
 
-    async def _handle_connection_cr(self, reader, writer):
+    async def _handle_connection_cr(self, reader: asyncio.StreamReader, writer):
         try:
-            line = await reader.readline()
+            # client says init
+            line = await _reader_readmsg(reader)
+
             if line != _init_string:
                 return
 
+            # we send back targets
             obj = {
                 "targets": sorted(self.targets.keys()),
-                "description": self.description
+                "description": self.description,
             }
-            line = pyon.encode(obj) + "\n"
-            writer.write(line.encode())
-            line = await reader.readline()
-            if not line:
-                return
-            target_name = line.decode()[:-1]
+            await _writer_writemessage(writer, obj)
+
+            # client selects target
+            line = await _reader_readmsg(reader)
+
+            target_name = line
             try:
                 target = self.targets[target_name]
             except KeyError:
@@ -612,21 +638,29 @@ class Server(_AsyncioServer):
             if callable(target):
                 target = target()
 
+            # we send valid methods
+
             valid_methods = inspect.getmembers(target, callable)
             valid_methods = {m[0] for m in valid_methods}
             if self.builtin_terminate:
                 valid_methods.add("terminate")
-            writer.write((pyon.encode(valid_methods) + "\n").encode())
 
+            await _writer_writemessage(writer, list(valid_methods))
+
+            # now we start answering rpc requests.
             while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                reply = await self._process_and_pyonize(target,
-                                                        pyon.decode(line.decode()))
+                try:
+                    obj = await _reader_readmsg(reader)
+                except asyncio.IncompleteReadError as e:
+                    if e.partial == b"":
+                        break
+
+                reply = await self._process(target, obj)
                 if reply is None:
                     return
-                writer.write((reply + "\n").encode())
+
+                await _writer_writemessage(writer, reply)
+
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             # May happens on Windows when client disconnects
             pass
@@ -637,7 +671,9 @@ class Server(_AsyncioServer):
         await self._terminate_request.wait()
 
 
-def simple_server_loop(targets, host, port, description=None, allow_parallel=False, *, loop=None):
+def simple_server_loop(
+    targets, host, port, description=None, allow_parallel=False, *, loop=None
+):
     """Runs a server until an exception is raised (e.g. the user hits Ctrl-C)
     or termination is requested by a client.
 
@@ -655,10 +691,15 @@ def simple_server_loop(targets, host, port, description=None, allow_parallel=Fal
             server = Server(targets, description, True, allow_parallel)
             used_loop.run_until_complete(server.start(host, port))
             try:
-                _, pending = used_loop.run_until_complete(asyncio.wait(
-                    [used_loop.create_task(signal_handler.wait_terminate()),
-                     used_loop.create_task(server.wait_terminate())],
-                    return_when=asyncio.FIRST_COMPLETED))
+                _, pending = used_loop.run_until_complete(
+                    asyncio.wait(
+                        [
+                            used_loop.create_task(signal_handler.wait_terminate()),
+                            used_loop.create_task(server.wait_terminate()),
+                        ],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                )
                 for task in pending:
                     task.cancel()
             finally:

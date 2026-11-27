@@ -61,7 +61,7 @@ class AsyncioServer:
         """
         self.server = await asyncio.start_server(self._handle_connection,
                                                  host, port,
-                                                 limit=4*1024*1024)
+                                                 limit=100*1024*1024)
 
     async def stop(self):
         """Stops the server."""

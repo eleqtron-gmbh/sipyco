@@ -15,4 +15,5 @@ setup(
             "sipyco_rpctool = sipyco.sipyco_rpctool:main",
         ]
     },
+    install_requires=["numpy", "msgpack", "msgpack-numpy"]
 )
